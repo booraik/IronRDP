@@ -31,9 +31,12 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{BitmapCodecs, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use ironrdp::pdu::rdp::headers::ShareDataPdu;
+use ironrdp::pdu::rdp::suppress_output::SuppressOutputPdu;
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
@@ -618,6 +621,10 @@ pub(crate) enum RdpInputEvent {
         scale_factor: Option<u32>,
         physical_size: Option<(u32, u32)>,
     },
+    /// Stop (`false`) or resume (`true`) the server's display updates.
+    DisplayUpdates {
+        allow: bool,
+    },
     TerminateSession,
 }
 
@@ -746,6 +753,8 @@ impl iron_remote_desktop::Session for Session {
 
         // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
         let activation_factory = connection_result.activation_factory;
+
+        let mut suppress_output_support = connection_result.suppress_output_support;
 
         let mut active_stage = ActiveStageBuilder {
             static_channels: connection_result.static_channels,
@@ -927,6 +936,23 @@ impl iron_remote_desktop::Session for Session {
                                 vec![ActiveStageOutput::ResponseFrame(response_frame?)]
                             } else {
                                 debug!("Resize event ignored");
+                                Vec::new()
+                            }
+                        },
+                        RdpInputEvent::DisplayUpdates { allow } => {
+                            // UNTESTED: the PDU goes out only while the server advertises Suppress Output
+                            // support, which reactivation refreshes. No test drives this loop; check both
+                            // when changing how capabilities reach it.
+                            if suppress_output_support {
+                                debug!(allow, "Display updates toggled");
+                                let mut frame = WriteBuf::new();
+                                active_stage.encode_static(
+                                    &mut frame,
+                                    ShareDataPdu::SuppressOutput(suppress_output_pdu(allow, image.width(), image.height())),
+                                )?;
+                                vec![ActiveStageOutput::ResponseFrame(frame.into_inner())]
+                            } else {
+                                debug!("Display updates toggle ignored: the server does not support Suppress Output");
                                 Vec::new()
                             }
                         },
@@ -1125,10 +1151,12 @@ impl iron_remote_desktop::Session for Session {
                                 pointer_software_rendering,
                                 static_channel_chunk_size,
                                 window_support_level,
+                                suppress_output_support: reactivated_suppress_output_support,
                                 ..
                             } = connection_activation.connection_activation_state()
                             {
                                 debug!("Deactivation-Reactivation Sequence completed");
+                                suppress_output_support = reactivated_suppress_output_support;
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                                 if !active_stage.reactivate(
                                     connection_activation.io_channel_id(),
@@ -1324,6 +1352,19 @@ impl iron_remote_desktop::Session for Session {
 
                 return Ok(JsValue::NULL);
             };
+            |display_updates: JsValue| {
+                let allow = display_updates
+                    .as_bool()
+                    .context("display_updates expects a boolean")
+                    .map_err(IronError::from)?;
+
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::DisplayUpdates { allow })
+                    .context("send display updates toggle")
+                    .map_err(IronError::from)?;
+
+                return Ok(JsValue::NULL);
+            };
             |initiate_file_copy: JsValue| {
                 let file_list = parse_file_metadata_array(initiate_file_copy)?;
 
@@ -1515,6 +1556,19 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
     }
 
     Ok(file_list)
+}
+
+/// Builds the Suppress Output PDU ([MS-RDPBCGR] 2.2.11.3.1) a client sends when its window is
+/// hidden or shown again. Resuming names the whole desktop, so the server repaints all of it.
+fn suppress_output_pdu(allow: bool, width: u16, height: u16) -> SuppressOutputPdu {
+    SuppressOutputPdu {
+        desktop_rect: allow.then(|| InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: width.saturating_sub(1),
+            bottom: height.saturating_sub(1),
+        }),
+    }
 }
 
 fn build_config(
@@ -2116,6 +2170,20 @@ mod tests {
         assert_eq!(
             macos_major_version_from_user_agent("Mozilla/5.0 (Windows NT 10.0)"),
             None
+        );
+    }
+
+    #[test]
+    fn suppress_output_pdu_stops_or_resumes_the_whole_desktop() {
+        assert_eq!(suppress_output_pdu(false, 1280, 720).desktop_rect, None);
+        assert_eq!(
+            suppress_output_pdu(true, 1280, 720).desktop_rect,
+            Some(InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: 1279,
+                bottom: 719,
+            })
         );
     }
 

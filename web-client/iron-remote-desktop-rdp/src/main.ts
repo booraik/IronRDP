@@ -76,6 +76,16 @@ export function legacyGraphics(enable: boolean): Extension {
     return new Extension('legacy_graphics', enable);
 }
 
+/**
+ * Stop (`false`) or resume (`true`) the server's display updates, as a desktop client does when
+ * its window is minimized or restored. Pass to `Session.invokeExtension`, for example on
+ * `visibilitychange`. Resuming repaints the whole desktop. Ignored when the server does not
+ * support the Suppress Output PDU.
+ */
+export function displayUpdates(allow: boolean): Extension {
+    return new Extension('display_updates', allow);
+}
+
 // --- RDCleanPath ---
 
 export { RDCleanPathErrorCode } from './RDCleanPathErrorCode';
